@@ -32,14 +32,14 @@
 # Fail fast and fail hard.
 set -eo pipefail
 
-# Prepend proper path for virtualenv hackery. This will be deprecated soon.
-export PATH=:/usr/local/bin:$PATH
-
 # Paths.
 BIN_DIR=$(cd $(dirname $0); pwd) # absolute path
 ROOT_DIR=$(dirname $BIN_DIR)
 BUILD_DIR=$1
 CACHE_DIR=$2
+
+# Prepend proper path buildpack use.
+export PATH=$BUILD_DIR/.heroku/python/bin:$PATH
 
 # The detected application type (`Python`|`Python/Django`).
 NAME=$($BIN_DIR/detect $BUILD_DIR)
@@ -55,10 +55,8 @@ LEGACY_VIRTUALENV_DIRS="bin include lib"
 LEGACY_VIRTUALENV_TRIGGER="lib/python2.7"
 PROFILE_PATH="$1/.profile.d/python.sh"
 
-
 # Python version. This will be used in the future to specify custom Pythons.
-PYTHON_VERSION="2.7.2"
-PYTHON_EXE="python2.7"
+PYTHON_VERSION="python-2.6.2"
 
 # Sanitizing environment variables.
 unset GIT_DIR PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LIBRARY_PATH
@@ -70,11 +68,6 @@ export PIP_DOWNLOAD_CACHE BUILD_DIR CACHE_DIR BIN_DIR PROFILE_PATH
 indent() {
   RE="s/^/       /"
   [ $(uname) == "Darwin" ] && sed -l "$RE" || sed -u "$RE"
-}
-
-# Virtualenv wrapper.
-function virtualenv (){
-  python "$ROOT_DIR/vendor/virtualenv-1.7.2/virtualenv.py" "$@"
 }
 
 # Buildpack Steps.
@@ -132,17 +125,6 @@ if [ -d $CACHE_DIR/$LEGACY_VIRTUALENV_TRIGGER ]; then
   VIRTUALENV_LOC=$LEGACY_VIRTUALENV_LOC
   VIRTUALENV_DIRS=$LEGACY_VIRTUALENV_DIRS
   CACHED_DIRS=$LEGACY_VIRTUALENV_DIRS
-
-  # Warn for a checked-in virtualenv.
-  if [ -d "lib" ] || [ -d "bin" ]; then
-    puts-warn "You have a virtualenv checked in. You should ignore the appropriate paths in your repo. See http://devcenter.heroku.com/articles/gitignore for more info.";
-  fi
-
-  # Reject a conflicting checked-in virtualenv.
-  if [ -f "lib/python2.7" ]; then
-    puts-warn "Checked-in virtualenv conflict."
-    exit 1;
-  fi
 fi
 
 # Restore old artifacts from the cache.
@@ -150,45 +132,45 @@ for dir in $CACHED_DIRS; do
   cp -R $CACHE_DIR/$dir . &> /dev/null || true
 done
 
-set +e
 # Create set-aside `.heroku` folder.
-mkdir .heroku &> /dev/null
-HEROKU_DIR_STATUS=$?
-
-# TODO: This is a new app, disable injection.
-# [ $HEROKU_DIR_STATUS -eq 0 ] && {
-  #TODO: touch .heroku/injection_disabled
-# }
-set -e
+mkdir -p .heroku &> /dev/null
 
 # Buildpack profile init script
 mkdir -p $(dirname $PROFILE_PATH)
 
-# ### Virtualenv Setup
-#
-
-# Create the virtualenv. Rebuild if corrupt.
-# TODO: Bootstrap a bottled Python VM...
-
 set +e
-puts-step "Preparing Python interpreter ($PYTHON_VERSION)"
-puts-step "Creating Virtualenv version $(virtualenv --version)"
+puts-step "Preparing Python runtime ($PYTHON_VERSION)"
 
-# Try to create the virtualenv.
-OUT=$(virtualenv --python $PYTHON_EXE --distribute --never-download --prompt='(venv) ' $VIRTUALENV_LOC 2>&1)
-
-[ $? -ne 0 -o -n "$CLEAN_VIRTUALENV" ] && {
-  if [ -n "$CLEAN_VIRTUALENV" ]
-    then echo " !     CLEAN_VIRTUALENV set, rebuilding virtualenv."
-    else echo " !     Virtualenv corrupt, rebuilding."
+# Install Python.
+if [ -f .heroku/python-version ]; then
+  if [ ! $(cat .heroku/python-version) = $PYTHON_VERSION ]; then
+    puts-step "Found $(cat .heroku/python-version), removing."
+    rm -fr .heroku/python
+  else
+    SKIP_INSTALL=1
   fi
-  for dir in $VIRTUALENV_DIRS; do
-    rm -fr $dir &> /dev/null || true
-  done
-  OUT=$(virtualenv --python $PYTHON_EXE --distribute --never-download  --prompt='(venv) ' $VIRTUALENV_LOC )
-}
-echo "$OUT" | indent
+fi
 
+if [ ! "$SKIP_INSTALL" ]; then
+  puts-step "Installing runtime $PYTHON_VERSION"
+  curl http://envy-versions.s3.amazonaws.com/$PYTHON_VERSION.tar.bz2 | tar jx
+  mv python .heroku/python
+
+  # Record for future reference.
+  echo $PYTHON_VERSION > .heroku/python-version
+
+  # Prepare it for the real world
+  curl -O http://python-distribute.org/distribute_setup.py
+  python distribute_setup.py
+
+  easy_install pip
+fi
+
+set +h
+
+
+puts-step "Success! Version: $(python --version)"
+puts-step "         Path: $(which python)"
 set -e
 
 # Pylibmc support.
@@ -196,8 +178,9 @@ set -e
 source $BIN_DIR/steps/pylibmc
 
 # Activate the Virtualenv.
-puts-step "Activating virtualenv"
-source $VIRTUALENV_LOC/bin/activate
+# puts-step "Activating virtualenv"
+# source $VIRTUALENV_LOC/bin/activate
+
 
 # Install Mercurial if it appears to be required.
 if (grep -Fiq "hg+" requirements.txt) then
@@ -206,7 +189,7 @@ fi
 
 # Install dependencies with Pip.
 puts-step "Installing dependencies using pip version $(pip --version | awk '{print $2}')"
-pip install --use-mirrors -r requirements.txt --exists-action=w --src=./.heroku/src | indent
+pip install --use-mirrors -r requirements.txt --exists-action=w --src=./.heroku/python/lib/python2.6/site-packages/ | indent
 
 # Do additional application hackery if applications appears to be a Django app.
 # Optionally, disable all Django-specific changes with `DISABLE_INJECTION` env.
@@ -217,15 +200,10 @@ if [ "$NAME" = "Python/Django" ]; then
   source $BIN_DIR/steps/django/init
 fi
 
-# Make Virtualenv's paths relative for portability.
-set +e
-OUT=$(virtualenv --python $PYTHON_EXE  --relocatable $VIRTUALENV_LOC)
-[ $? -ne 0 ] && {
-  puts-warn "Error making virtualenv relocatable"
-  echo "$OUT" | indent
-  exit 1
-}
-set -e
+# Convert binstubs.
+curl -O https://raw.github.com/gist/bb32029997367c74c6f9/convert.py
+python --version
+python convert.py .heroku/python/bin/
 
 # ### Finalize
 #
@@ -238,14 +216,15 @@ done
 
 # Set context environment variables.
 
-set-env PATH '$HOME/.heroku/venv/bin:$PATH'
+set-env PATH '$HOME/.heroku/python/bin:$PATH'
+set-env PYTHONHOME /app/.heroku/python/
 set-default-env PYTHONUNBUFFERED true
 set-default-env LIBRARY_PATH /app/.heroku/vendor/lib
 set-default-env LD_LIBRARY_PATH /app/.heroku/vendor/lib
 set-default-env LANG en_US.UTF-8
 set-default-env PYTHONHASHSEED random
-set-default-env PYTHONHOME /app/.heroku/venv/
 set-default-env PYTHONPATH /app/
+
 
 # ### Fin.
 
